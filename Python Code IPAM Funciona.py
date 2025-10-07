@@ -1,7 +1,7 @@
-# ipam_full_evidence.py (parche: guardar SOLO si cambia el running-config)
+# ipam_full_evidence.py  (versión mínima para cumplir P2-NCM-Backup)
 from netmiko import ConnectHandler
 from tabulate import tabulate
-import time, os, difflib, subprocess, re
+import time, os, difflib, subprocess
 from datetime import datetime
 
 HOST = "192.168.0.161"
@@ -9,6 +9,7 @@ USER = "admin"
 PASSWORD = "alfredo123"
 PORT = 22
 
+# comandos base (LOS MISMOS)
 COMMANDS = [
     "show ip interface brief",
     "show ip route",
@@ -18,70 +19,30 @@ COMMANDS = [
 
 PING_TARGETS = ["2.2.2.2", "3.3.3.3"]
 
-BACKUP_ROOT = "backups"
+BACKUP_ROOT = "backups"  # NUEVO: raíz de respaldos por dispositivo
 os.makedirs(BACKUP_ROOT, exist_ok=True)
-
-# --- NUEVO: normalizar líneas volátiles del running-config ---
-VOLATILE_PATTERNS = [
-    r"^!.*$",                                 # comentarios que algunos IOS incluyen
-    r"^Building configuration.*$",
-    r"^Current configuration.*$",
-    r"^Last configuration change.*$",
-    r"^! Last configuration change.*$",
-    r"^ntp clock-period.*$",
-    r"^clock-period.*$",                      # algunos equipos
-    r"^boot-start-marker.*$",
-    r"^boot-end-marker.*$",
-    r"^time-range .*",                        # si se usa y rota
-    r"^service timestamps .*",                # marcas de tiempo en logs
-    r"^spanning-tree vlan \d+ priority \d+$", # si lo tocan dinámicamente
-    r"^end$"                                  # línea final que no aporta a diffs
-]
-
-def normalize_config(text: str) -> str:
-    lines = []
-    for line in text.splitlines():
-        # filtra líneas que matchean cualquiera de los patrones volátiles
-        if any(re.search(pat, line) for pat in VOLATILE_PATTERNS):
-            continue
-        # quita espacios de cola
-        lines.append(line.rstrip())
-    # colapsa múltiples líneas vacías consecutivas
-    cleaned = []
-    last_blank = False
-    for l in lines:
-        if l == "":
-            if last_blank:
-                continue
-            last_blank = True
-        else:
-            last_blank = False
-        cleaned.append(l)
-    return "\n".join(cleaned).strip() + "\n"
 
 def _git_push_if_needed(msg):
     try:
-        # Solo comitea si hay cambios en el working tree
         subprocess.run(["git", "add", "."], check=False)
-        # Si no hay cambios, 'git commit' saldrá con código != 0; lo ignoramos
+        # commit solo si hay cambios en staging
         subprocess.run(["git", "commit", "-m", msg], check=False)
         subprocess.run(["git", "push"], check=False)
     except Exception:
+        # si no hay git o credenciales, no rompemos el backup
         pass
 
-def _last_cfg_path(folder):
-    # busca el último archivo de config “_running_cfg_*.txt”
+def _last_backup_path(folder):
     if not os.path.isdir(folder):
         return None
-    files = sorted([f for f in os.listdir(folder) if f.endswith("_running_cfg.txt")])
-    return os.path.join(folder, files[-1]) if files else None
+    txts = sorted([f for f in os.listdir(folder) if f.endswith(".txt") and f != "current.txt"])
+    return os.path.join(folder, txts[-1]) if txts else None
 
-def _different_cfg(curr_norm_text: str, last_path: str) -> bool:
-    if not last_path or not os.path.exists(last_path):
+def _different_files(a, b):
+    if not b or not os.path.exists(b):
         return True
-    with open(last_path, "r", encoding="utf-8", errors="ignore") as fb:
-        prev = fb.read()
-    diff = list(difflib.unified_diff(prev.splitlines(True), curr_norm_text.splitlines(True)))
+    with open(a, encoding="utf-8", errors="ignore") as fa, open(b, encoding="utf-8", errors="ignore") as fb:
+        diff = list(difflib.unified_diff(fa.readlines(), fb.readlines()))
     return len(diff) > 0
 
 def run_once():
@@ -103,89 +64,87 @@ def run_once():
         print("ERROR: No se pudo conectar:", e)
         return
 
-    # 1) OBTENER RUNNING-CONFIG Y COMPARAR (base de verdad)
-    try:
-        raw_cfg = conn.send_command("show running-config", delay_factor=1)
-    except Exception as e:
-        print("ERROR al obtener running-config:", e)
-        conn.disconnect()
-        return
-
-    norm_cfg = normalize_config(raw_cfg)
+    # ===== Generar salida como antes (tu evidencia completa) =====
+    timestamp_humano = time.strftime("%Y-%m-%d %H:%M:%S")
+    # NUEVO: carpeta por dispositivo
     device_folder = os.path.join(BACKUP_ROOT, HOST)
     os.makedirs(device_folder, exist_ok=True)
 
-    last_cfg_path = _last_cfg_path(device_folder)
+    # archivo temporal "current" para comparar
+    temp_path = os.path.join(device_folder, "current.txt")
+    with open(temp_path, "w", encoding="utf-8") as f:
+        f.write(f"IPAM evidence generated: {timestamp_humano}\n")
+        f.write("="*60 + "\n\n")
 
-    if _different_cfg(norm_cfg, last_cfg_path):
+        for cmd in COMMANDS:
+            f.write(f">>> {cmd}\n")
+            try:
+                out = conn.send_command(cmd, delay_factor=1)
+            except Exception as exc:
+                out = f"ERROR ejecutando comando: {exc}"
+            f.write(out + "\n\n")
+
+        for target in PING_TARGETS:
+            cmd = f"ping {target}"
+            f.write(f">>> {cmd}\n")
+            try:
+                out = conn.send_command(cmd, delay_factor=1)
+            except Exception as exc:
+                out = f"ERROR ejecutando ping: {exc}"
+            f.write(out + "\n\n")
+
+    # ===== PARSEOS PARA CONSOLA (igual que tu script) =====
+    raw_interfaces = conn.send_command("show ip interface brief")
+    rows = []
+    for line in raw_interfaces.splitlines():
+        if line.strip() and not line.startswith("Interface"):
+            parts = line.split()
+            if len(parts) >= 2:
+                iface = parts[0]
+                ip = parts[1] if parts[1].lower() != "unassigned" else ""
+                status = " ".join(parts[4:6]) if len(parts) >= 6 else ""
+                rows.append([iface, ip, status])
+
+    raw_neighbors = conn.send_command("show ip ospf neighbor")
+    neigh_rows = []
+    for line in raw_neighbors.splitlines():
+        if line.strip() and line[0].isdigit():
+            parts = line.split()
+            if len(parts) >= 6:
+                neigh_id = parts[0]
+                state = parts[2]
+                address = parts[4]
+                iface = parts[5]
+                neigh_rows.append([neigh_id, state, address, iface])
+
+    conn.disconnect()
+
+    print("\n==== INTERFACES (R1) ====")
+    print(tabulate(rows, headers=["Interface", "IP", "Status"], tablefmt="pretty"))
+
+    print("\n==== OSPF NEIGHBORS (R1) ====")
+    print(tabulate(neigh_rows, headers=["Neighbor ID","State","Address","Interface"], tablefmt="pretty"))
+
+    # ===== Comparar con el último backup y guardar SOLO si cambió =====
+    last = _last_backup_path(device_folder)
+    if _different_files(temp_path, last):
         ts = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        final_name = f"{HOST}_backup_{ts}.txt"     # nombre con fecha/hora
+        final_path = os.path.join(device_folder, final_name)
+        os.replace(temp_path, final_path)
+        print(f"\n✅ Cambios detectados. Backup guardado en {final_path}")
 
-        # 2) GUARDAR NUEVO BACKUP DE CONFIG (normalizada o cruda; aquí guardamos cruda)
-        cfg_path = os.path.join(device_folder, f"{HOST}_running_cfg.txt")  # siempre el “actual”
-        with open(cfg_path, "w", encoding="utf-8") as f:
-            f.write(norm_cfg)  # puedes cambiar a raw_cfg si prefieres crudo; la comparación ya fue con norm_cfg
-
-        # 3) (OPCIONAL) GENERAR TU EVIDENCIA COMPLETA SOLO CUANDO HAY CAMBIO
-        evidence_name = f"{HOST}_evidence_{ts}.txt"
-        evidence_path = os.path.join(device_folder, evidence_name)
-        with open(evidence_path, "w", encoding="utf-8") as f:
-            f.write(f"IPAM evidence generated: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
-            f.write("="*60 + "\n\n")
-            for cmd in COMMANDS:
-                f.write(f">>> {cmd}\n")
-                try:
-                    out = conn.send_command(cmd, delay_factor=1)
-                except Exception as exc:
-                    out = f"ERROR ejecutando comando: {exc}"
-                f.write(out + "\n\n")
-            for target in PING_TARGETS:
-                cmd = f"ping {target}"
-                f.write(f">>> {cmd}\n")
-                try:
-                    out = conn.send_command(cmd, delay_factor=1)
-                except Exception as exc:
-                    out = f"ERROR ejecutando ping: {exc}"
-                f.write(out + "\n\n")
-
-        # 4) INFO DE CONSOLA (igual que antes)
-        raw_interfaces = conn.send_command("show ip interface brief")
-        rows = []
-        for line in raw_interfaces.splitlines():
-            if line.strip() and not line.startswith("Interface"):
-                parts = line.split()
-                if len(parts) >= 2:
-                    iface = parts[0]
-                    ip = parts[1] if parts[1].lower() != "unassigned" else ""
-                    status = " ".join(parts[4:6]) if len(parts) >= 6 else ""
-                    rows.append([iface, ip, status])
-
-        raw_neighbors = conn.send_command("show ip ospf neighbor")
-        neigh_rows = []
-        for line in raw_neighbors.splitlines():
-            if line.strip() and line[0].isdigit():
-                parts = line.split()
-                if len(parts) >= 6:
-                    neigh_id = parts[0]
-                    state = parts[2]
-                    address = parts[4]
-                    iface = parts[5]
-                    neigh_rows.append([neigh_id, state, address, iface])
-
-        conn.disconnect()
-
-        print("\n✅ Cambios detectados en running-config. Se guardó backup y evidencia.")
-        print(f"- Config (normalizada): {cfg_path}")
-        print(f"- Evidencia: {evidence_path}")
-
-        # 5) SUBIR A GITHUB SOLO CUANDO HAY CAMBIO
+        # push automático a GitHub (silencioso si no hay git)
         _git_push_if_needed(f"Backup {HOST} {ts}")
-
     else:
-        conn.disconnect()
-        print("\n⚙️ Sin cambios en running-config: no se guardó nada y no hubo push.")
+        os.remove(temp_path)
+        print("\n⚙️ Sin cambios: no se generó un nuevo backup.")
+
+    print(f"\nEvidencia/listado en: {device_folder}")
 
 if __name__ == "__main__":
-    # loop cada 5s, pero ahora NO creará archivos a menos que cambie la config
+    # ejecutar cada 5 segundos (requisito)
     while True:
         run_once()
+        print("\nEsperando 5 segundos para el siguiente ciclo...\n")
         time.sleep(5)
