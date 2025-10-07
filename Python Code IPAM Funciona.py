@@ -132,13 +132,13 @@ def run_once():
         final_name = f"{HOST}_backup_{ts}.txt"     # nombre con fecha/hora
         final_path = os.path.join(device_folder, final_name)
         os.replace(temp_path, final_path)
-        print(f"\n✅ Cambios detectados. Backup guardado en {final_path}")
+        print(f"\n Cambios detectados. Backup guardado en {final_path}")
 
         # push automático a GitHub (silencioso si no hay git)
         _git_push_if_needed(f"Backup {HOST} {ts}")
     else:
         os.remove(temp_path)
-        print("\n⚙️ Sin cambios: no se generó un nuevo backup.")
+        print("\n Sin cambios: no se generó un nuevo backup.")
 
     print(f"\nEvidencia/listado en: {device_folder}")
 
